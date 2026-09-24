@@ -1,76 +1,57 @@
-import socket
 import os
 
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from tun.tun_device import TunDevice
+from crypto.encryption import Encryption
+from network.transport import Transport
+from network.tunnel import Tunnel
 
 
-# Generate emphemeral ECDH key pair
-private_key = ec.generate_private_key(ec.SECP256R1())
-publlic_key = private_key.public_key()
-public_key_bytes = publlic_key.public_bytes(encoding=serialization.Encoding.X962, format=serialization.PublicFormat.CompressedPoint)
-
-HOST ="192.168.1.4"
+HOST = "127.0.0.1"
 PORT = 5555
 
-def recv_exactly(sock, number_of_bytes):
-    data = b""
-    while len(data) <number_of_bytes:
-        chunk=sock.recv(number_of_bytes - len(data))
-        if not chunk:
-            raise ConnectionError("Connection closed before receiving all data")
-        data += chunk
-    return data
 
+tun = TunDevice("tun0")
 
-#Create TCP socket, connect to server
-client_socket=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-client_socket.connect((HOST, PORT))
-#Send client's public key and receive server's public key
-client_socket.sendall(public_key_bytes)
-print("Client public key sent")
-server_public_key_bytes =recv_exactly(client_socket, 33)
-print("Recieved server public key:")
-server_public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), server_public_key_bytes)
-print("Server public key reconstructed successfully")
-
-#calculate the shared secret
-shared_secret = private_key.exchange(ec.ECDH(),server_public_key)
-encryption_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"VPN Key").derive(shared_secret)
-aesgcm = AESGCM(encryption_key)
-print("AES-GCM initialized on client")
-
-
-#Get message from user, and send it to server
 try:
-    while True:
-        message = input("Enter the message: ")
-        plaintext = message.encode("utf-8")
-        nonce = os.urandom(12)
-        ciphertext = aesgcm.encrypt(nonce,plaintext,None)
-        encrypted_message = nonce + ciphertext
-        message_length = len(encrypted_message)
-        length_bytes = message_length.to_bytes(4, byteorder="big")
-        client_socket.sendall(length_bytes + encrypted_message)
-        if message.lower() == "exit":
-            break
+    tun.create()
+    print("TunnelForge client TUN interface ready")
 
-    #Acoknowledgement from server
-    length_data = recv_exactly(client_socket,4)
-    reply_length = int.from_bytes(length_data, byteorder="big")
-    encrypted_reply = recv_exactly(client_socket,reply_length)
-    reply_nonce = encrypted_reply[:12]
-    reply_ciphertext = encrypted_reply[12:]
-    reply_plaintext = aesgcm.decrypt(reply_nonce,reply_ciphertext,None)
-    reply = reply_plaintext.decode("utf-8")
-    print(f"Server replied : {reply}")
+    os.system("ip addr add 10.10.0.1/24 dev tun0")
+    os.system("ip link set tun0 up")
+
+    transport = Transport()
+    transport.connect(HOST, PORT)
+
+    client_private = Encryption.generate_key_exchange()
+    client_public = Encryption.get_public_key(client_private)
+    transport.send(client_public)
+
+    server_public = transport.receive()
+    session_key = Encryption.derive_session_key(client_private, server_public)
+    crypto = Encryption(session_key)
+    print("In-memory session key established on client")
     
-except ConnectionError:
-    print("Connection closed unexpectedly")
+
+    tunnel = Tunnel(
+        tun=tun,
+        transport=transport,
+        crypto=crypto
+    )
+
+    print("TunnelForge client tunnel ready")
+    print("Starting bidirectional packet processing...\n")
+
+    tunnel.start()
+
+except ConnectionError as e:
+    print(f"Connection error: {e}")
+
 except KeyboardInterrupt:
-    print("\nConnection interrupted by user!!!")
+    print("\nClient interrupted")
+
 finally:
-    client_socket.close()
+    tunnel.stop() if "tunnel" in locals() else None
+    transport.close() if "transport" in locals() else None
+    tun.close()
+
+    print("Client resources closed")

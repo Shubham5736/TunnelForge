@@ -1,826 +1,1524 @@
 # TunnelForge
 
-TunnelForge is a Python-based encrypted TCP communication project.
+TunnelForge is an educational encrypted network-tunneling project
+written in Python.
 
-It demonstrates how two devices can establish a secure communication channel using:
+The project demonstrates how a VPN-like tunnel can be built from
+lower-level components:
 
-* TCP sockets
-* Elliptic Curve Diffie-Hellman (ECDH)
-* P-256 elliptic curve cryptography
-* HKDF-SHA256
-* AES-256-GCM authenticated encryption
-* Random nonces
-* Length-prefixed TCP message framing
-* Graceful connection handling
-* Windows ↔ Android/Termux communication
+-   Linux TUN interfaces for capturing and injecting IP packets
+-   A transport layer for moving tunnel data between client and server
+-   Ephemeral X25519 key exchange
+-   HKDF-SHA256 session-key derivation
+-   Persistent Ed25519 identity keys
+-   Trusted-peer identity verification
+-   Signed ephemeral keys to authenticate the key exchange
+-   AES-256-GCM authenticated encryption for tunnel traffic
+-   Bidirectional packet forwarding between the TUN interface and the
+    network transport
 
-The project was built step-by-step to understand how encrypted network communication works rather than relying on a high-level VPN library.
+> **Current implementation:** TunnelForge uses **TCP** as its transport.
+> UDP transport is planned as a later architectural stage and is not
+> part of the code documented here.
 
-> **Current status:** TunnelForge is an encrypted TCP communication prototype. It is not yet a complete production VPN.
+This project is intended for learning, experimentation, protocol design,
+Linux networking, and cryptographic engineering. It is **not
+production-ready VPN software**.
 
----
+------------------------------------------------------------------------
 
-## 1. How TunnelForge Works
+## 1. Architecture
 
-The basic communication flow is:
+At a high level, TunnelForge works like this:
 
-```text
-                TunnelForge
-                     |
-        +------------+------------+
-        |                         |
-     Client                    Server
-        |                         |
-        | ---- TCP Connect ------>|
-        |                         |
-        | <--- ECDH Public Key -->|
-        |                         |
-        | ---- ECDH Public Key -->|
-        |                         |
-        |    Shared Secret        |
-        |       derived           |
-        |                         |
-        |       HKDF              |
-        |         ↓               |
-        |   32-byte AES key       |
-        |                         |
-        |==== AES-GCM Messages ===>|
-        |                         |
-        |<=== AES-GCM Reply ======|
+``` text
+                     TunnelForge
+              =========================
+
+ Client machine                              Server machine
+ ┌───────────────┐                           ┌───────────────┐
+ │ Application   │                           │ Application   │
+ └───────┬───────┘                           └───────┬───────┘
+         │                                           │
+         ▼                                           ▼
+ ┌───────────────┐                           ┌───────────────┐
+ │    tun0       │                           │    tun1       │
+ │ 10.10.0.1/24  │                           │ 10.20.0.1/24  │
+ └───────┬───────┘                           └───────┬───────┘
+         │                                           │
+         ▼                                           ▲
+ ┌───────────────────────────────────────────────────────────┐
+ │                         Tunnel                             │
+ │                                                           │
+ │  TUN → read packet → AES-GCM encrypt → Transport →       │
+ │                                                           │
+ │  TUN ← write packet ← AES-GCM decrypt ← Transport ←       │
+ └───────────────────────────────────────────────────────────┘
+                         │
+                         │ TCP :5555
+                         │
+                  ┌──────▼──────┐
+                  │ TCP socket  │
+                  └─────────────┘
 ```
 
-The important point is that the client and server do **not** directly send the AES encryption key to each other.
+The `Tunnel` class runs two directions concurrently:
 
-Instead, both sides independently derive the same shared secret using ECDH.
+1.  Read an IP packet from the TUN interface, encrypt it, and send it
+    through the transport.
+2.  Receive an encrypted packet from the transport, decrypt it, and
+    write the resulting IP packet to the TUN interface.
 
----
+The implementation uses two threads for these directions.
 
-# 2. Project Structure
+------------------------------------------------------------------------
 
-The current project contains:
+## 2. Project Structure
 
-```text
+The code is organized into separate modules:
+
+``` text
 TunnelForge/
-│
-├── .gitignore
 ├── client.py
 ├── server.py
+│
+├── tun/
+│   └── tun_device.py
+│
+├── network/
+│   ├── transport.py
+│   └── tunnel.py
+│
+├── crypto/
+│   └── encryption.py
+│
+├── keys/
+│   ├── client/
+│   │   ├── identity_private.bin
+│   │   ├── identity_public.bin
+│   │   └── trusted_server_public.bin
+│   │
+│   └── server/
+│       ├── identity_private.bin
+│       ├── identity_public.bin
+│       └── trusted_client_public.bin
+│
 └── README.md
 ```
 
-### `server.py`
+Python package directories should contain `__init__.py` files if your
+local project requires regular package imports.
 
-The server:
+------------------------------------------------------------------------
 
-1. Creates a TCP socket.
-2. Listens for incoming connections.
-3. Performs the ECDH key exchange.
-4. Derives the encryption key using HKDF.
-5. Receives encrypted messages.
-6. Decrypts messages using AES-GCM.
-7. Detects the `exit` message.
-8. Sends an encrypted acknowledgement.
-9. Closes the connection gracefully.
+## 3. Main Components
 
-### `client.py`
+### 3.1 `tun/tun_device.py`
+
+`TunDevice` provides a small wrapper around Linux's `/dev/net/tun`.
+
+It:
+
+-   Opens `/dev/net/tun`
+-   Creates a TUN interface
+-   Uses `IFF_TUN | IFF_NO_PI`
+-   Reads raw IP packets
+-   Writes raw IP packets
+-   Closes the TUN file descriptor
+
+The implementation reads up to 65535 bytes from the TUN device.
+
+Example interface usage:
+
+``` text
+tun0 → client
+tun1 → server
+```
+
+The current client assigns:
+
+``` text
+10.10.0.1/24
+```
+
+and the server assigns:
+
+``` text
+10.20.0.1/24
+```
+
+------------------------------------------------------------------------
+
+### 3.2 `network/transport.py`
+
+The current transport layer is TCP.
+
+It:
+
+-   Creates an IPv4 TCP socket
+-   Connects the client to the server
+-   Sends data using a 4-byte big-endian length prefix
+-   Receives exactly the requested number of bytes
+-   Reconstructs complete application messages from the TCP byte stream
+-   Closes the socket
+
+The current framing is:
+
+``` text
+┌──────────────┬──────────────────────┐
+│ 4-byte size  │      payload         │
+└──────────────┴──────────────────────┘
+```
+
+The length prefix is necessary because TCP is a byte stream and does not
+preserve application message boundaries.
+
+This is intentionally separated from the `Tunnel` class so the transport
+can later be replaced by another mechanism.
+
+------------------------------------------------------------------------
+
+### 3.3 `network/tunnel.py`
+
+`Tunnel` connects the TUN device, transport, and cryptographic layer.
+
+The outbound path is:
+
+``` text
+TUN packet
+   ↓
+AES-GCM encryption
+   ↓
+Transport.send()
+   ↓
+TCP
+```
+
+The inbound path is:
+
+``` text
+TCP
+   ↓
+Transport.receive()
+   ↓
+AES-GCM decryption
+   ↓
+TUN packet
+```
+
+Two threads are used:
+
+``` text
+tun_to_network()
+network_to_tun()
+```
+
+This allows packets to travel in both directions simultaneously.
+
+------------------------------------------------------------------------
+
+### 3.4 `crypto/encryption.py`
+
+The cryptographic layer contains the project's crypto logic.
+
+It uses:
+
+  Purpose                   Algorithm
+  ------------------------- --------------------
+  Data encryption           AES-GCM
+  Ephemeral key exchange    X25519
+  Session-key derivation    HKDF-SHA256
+  Long-term identity        Ed25519
+  Identity authentication   Ed25519 signatures
+
+#### Session key
+
+The client and server generate fresh X25519 ephemeral key pairs.
+
+The X25519 shared secret is then passed through:
+
+``` text
+HKDF-SHA256
+```
+
+with:
+
+``` text
+length = 32 bytes
+info = "TunnelForge-v1"
+```
+
+The result is used as the AES-GCM session key.
+
+Both sides independently derive the same session key.
+
+#### Packet encryption
+
+Each packet is encrypted with AES-GCM using a fresh 12-byte nonce.
+
+The transmitted encrypted value is:
+
+``` text
+12-byte nonce || AES-GCM ciphertext
+```
+
+AES-GCM provides both confidentiality and integrity/authentication for
+the encrypted packet.
+
+------------------------------------------------------------------------
+
+## 4. Authenticated Handshake
+
+TunnelForge does more than perform unauthenticated X25519 key exchange.
+
+The current design uses persistent Ed25519 identity keys to authenticate
+ephemeral X25519 keys.
+
+### Client side
 
 The client:
 
-1. Creates a TCP socket.
-2. Connects to the server.
-3. Performs the ECDH key exchange.
-4. Derives the same encryption key.
-5. Encrypts messages using AES-GCM.
-6. Sends encrypted messages to the server.
-7. Sends `exit` when finished.
-8. Receives and decrypts the server acknowledgement.
-9. Closes the connection gracefully.
+1.  Loads its persistent Ed25519 identity private key.
+2.  Generates a fresh X25519 ephemeral private key.
+3.  Derives the X25519 public key.
+4.  Signs the ephemeral X25519 public key with its Ed25519 identity key.
+5.  Sends:
 
----
-
-# 3. Requirements
-
-## Server/Client computer
-
-Python 3 is required.
-
-Check your Python installation:
-
-```powershell
-python --version
+``` text
+X25519 public key (32 bytes)
++
+Ed25519 signature (64 bytes)
 ```
 
-You also need the Python `cryptography` package.
+Total:
 
-Install it with:
+``` text
+96 bytes
+```
 
-```powershell
+### Server side
+
+The server:
+
+1.  Receives the client's 96-byte payload.
+2.  Splits it into the X25519 public key and Ed25519 signature.
+3.  Loads the trusted client Ed25519 public key.
+4.  Verifies the signature.
+5.  Only after successful verification uses the client's X25519 public
+    key.
+
+The server then performs the same operation for its own ephemeral key:
+
+``` text
+Server X25519 public key
+        +
+Server Ed25519 signature
+```
+
+The client verifies the server using its trusted server public key.
+
+Only after identity verification do both sides derive the session key.
+
+### Trust model
+
+The client stores the server's trusted identity public key:
+
+``` text
+keys/client/trusted_server_public.bin
+```
+
+The server stores the client's trusted identity public key:
+
+``` text
+keys/server/trusted_client_public.bin
+```
+
+This provides a basic static trust relationship suitable for the
+educational project.
+
+------------------------------------------------------------------------
+
+## 5. Requirements
+
+Recommended environment:
+
+-   Linux
+-   Python 3
+-   Root/sudo privileges
+-   `/dev/net/tun`
+-   `iproute2`
+-   Python `cryptography` package
+
+Parrot OS is suitable for running the project.
+
+Install the system networking tools:
+
+``` bash
+sudo apt update
+sudo apt install -y iproute2 python3 python3-pip python3-venv
+```
+
+------------------------------------------------------------------------
+
+## 6. Clone and Enter the Repository
+
+``` bash
+git clone <YOUR-GITHUB-REPOSITORY-URL>
+cd TunnelForge
+```
+
+If you are working from an existing local repository:
+
+``` bash
+cd /path/to/TunnelForge
+```
+
+------------------------------------------------------------------------
+
+## 7. Create a Python Virtual Environment
+
+Creating a virtual environment is recommended:
+
+``` bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Upgrade pip:
+
+``` bash
+python -m pip install --upgrade pip
+```
+
+Install the cryptography dependency:
+
+``` bash
 pip install cryptography
 ```
 
-If `pip` is associated with another Python installation, use:
+You can verify it with:
 
-```powershell
-python -m pip install cryptography
+``` bash
+python -c "import cryptography; print(cryptography.__version__)"
 ```
 
----
+------------------------------------------------------------------------
 
-# 4. Run TunnelForge on One Computer
+## 8. Generate the Identity Keys
 
-This is the easiest way to test the project.
+TunnelForge requires persistent Ed25519 identity keys for both peers.
 
-Both the server and client can run on the same computer using:
+The `Encryption` module contains the key-generation and persistence
+functionality.
 
-```text
-127.0.0.1
+You can generate the keys using the project's crypto test code:
+
+``` bash
+python crypto/encryption.py
 ```
 
-This is called the **localhost** address.
+The module's standalone test creates:
 
-The server uses port:
+``` text
+keys/client/identity_private.bin
+keys/client/identity_public.bin
 
-```text
-5555
+keys/server/identity_private.bin
+keys/server/identity_public.bin
 ```
 
----
+The private keys are stored with restrictive permissions:
 
-## Step 1 — Start the server
+``` text
+0600
+```
 
-Open a terminal in the TunnelForge directory.
+Public keys are stored with:
+
+``` text
+0644
+```
+
+### Important
+
+Do not commit private identity keys to GitHub.
+
+Add the following to `.gitignore`:
+
+``` gitignore
+keys/*/identity_private.bin
+```
+
+If this is a public repository, it is also safer to generate the
+identity keys locally instead of publishing any real private key
+material.
+
+------------------------------------------------------------------------
+
+## 9. Configure Trusted Peer Keys
+
+The client must trust the server's public identity key.
+
+Copy:
+
+``` bash
+cp keys/server/identity_public.bin \
+   keys/client/trusted_server_public.bin
+```
+
+The server must trust the client's public identity key.
+
+Copy:
+
+``` bash
+cp keys/client/identity_public.bin \
+   keys/server/trusted_client_public.bin
+```
+
+The resulting structure should be:
+
+``` text
+keys/
+├── client/
+│   ├── identity_private.bin
+│   ├── identity_public.bin
+│   └── trusted_server_public.bin
+│
+└── server/
+    ├── identity_private.bin
+    ├── identity_public.bin
+    └── trusted_client_public.bin
+```
+
+Verify the key sizes:
+
+``` bash
+wc -c keys/client/*.bin
+wc -c keys/server/*.bin
+```
+
+Expected public/private Ed25519 raw key sizes are 32 bytes.
+
+------------------------------------------------------------------------
+
+## 10. Configure the Server Address
+
+The client currently connects to:
+
+``` text
+192.168.100.2:5555
+```
+
+This is defined in `client.py`:
+
+``` python
+HOST = "192.168.100.2"
+PORT = 5555
+```
+
+Change `HOST` to the IP address of the machine running `server.py`.
+
+The server listens on:
+
+``` text
+0.0.0.0:5555
+```
+
+The port can be changed in both files, but the values must match.
+
+------------------------------------------------------------------------
+
+## 11. Firewall
+
+If a firewall is enabled on the server, allow TCP port `5555`.
+
+For example, with UFW:
+
+``` bash
+sudo ufw allow 5555/tcp
+```
+
+Check:
+
+``` bash
+sudo ufw status
+```
+
+Only expose the port to networks where you actually intend to run the
+experiment.
+
+------------------------------------------------------------------------
+
+# 12. Run the Server
+
+Start the server first:
+
+``` bash
+sudo python3 server.py
+```
+
+Expected output includes:
+
+``` text
+TunnelForge server listening on 0.0.0.0:5555
+```
+
+The server then waits for the client.
+
+When the client connects, it creates:
+
+``` text
+tun1
+```
+
+and assigns:
+
+``` text
+10.20.0.1/24
+```
+
+------------------------------------------------------------------------
+
+# 13. Run the Client
+
+In another terminal:
+
+``` bash
+sudo python3 client.py
+```
+
+The client creates:
+
+``` text
+tun0
+```
+
+and assigns:
+
+``` text
+10.10.0.1/24
+```
+
+The client then connects to the configured server:
+
+``` text
+192.168.100.2:5555
+```
+
+------------------------------------------------------------------------
+
+# 14. Expected Handshake
+
+A successful run should show messages similar to:
+
+``` text
+TunnelForge client TUN interface ready
+
+Starting authenticated handshake
+Sending authenticted client ephemeral key....
+Received authenticated server ephemeral key
+Server identity verification successful...
+TunnelForge client tunnel ready
+Starting bidirectional packet processing...
+```
+
+On the server:
+
+``` text
+TunnelForge server listening on 0.0.0.0:5555
+Client connected: ...
+TunnelForge server TUN interface ready
+
+Starting authenticated handshake...
+Received authenticated client ephemeral key
+Sending authenticated server ephemeral key...
+Authenticated session key established on server
+TunnelForge server tunnel ready
+Starting bidectional packet processing...
+```
+
+The exact output may differ slightly because it depends on the current
+source formatting.
+
+------------------------------------------------------------------------
+
+# 15. Verify the TUN Interfaces
+
+After starting both sides:
+
+``` bash
+ip addr show tun0
+```
+
+and:
+
+``` bash
+ip addr show tun1
+```
+
+The client should have:
+
+``` text
+10.10.0.1/24
+```
+
+The server should have:
+
+``` text
+10.20.0.1/24
+```
+
+Also check:
+
+``` bash
+ip link show tun0
+ip link show tun1
+```
+
+------------------------------------------------------------------------
+
+# 16. Test the TUN Device Independently
+
+Before debugging the complete tunnel, you can test the TUN wrapper
+itself.
 
 Run:
 
-```powershell
-python server.py
+``` bash
+sudo python3 tun/tun_device.py
 ```
 
-The server should display something similar to:
+It should create `tun0` and wait for a packet:
 
-```text
-Server listening on 0.0.0.0:5555
+``` text
+TUN interface 'tun0' created
+TUN interface created
+Waiting for a packet...
 ```
 
-The server is now waiting for a client.
+In another terminal, inspect the interface:
 
----
+``` bash
+ip addr show tun0
+```
 
-## Step 2 — Start the client
+The standalone test reads one packet and writes it back.
 
-Open a second terminal in the same directory.
+Stop the test with:
+
+``` text
+Ctrl+C
+```
+
+------------------------------------------------------------------------
+
+# 17. Test the Cryptographic Module
 
 Run:
 
-```powershell
-python client.py
+``` bash
+python3 crypto/encryption.py
 ```
 
-Make sure the client is configured to connect to:
+The standalone crypto tests cover several important properties.
 
-```text
-127.0.0.1
+### X25519
+
+It generates client and server ephemeral keys and verifies that both
+sides derive the same session key.
+
+Expected result:
+
+``` text
+Session key exchange successful
 ```
 
-The client should establish a connection with the server.
+### AES-GCM
 
----
+The test encrypts data with the derived session key and decrypts it with
+the other side's derived session key.
 
-## Step 3 — Send messages
+Expected result:
 
-The client will ask:
-
-```text
-Enter the message:
+``` text
+Encryption test successful
 ```
 
-For example:
+### Persistent identity keys
 
-```text
-Enter the message: Hello
-Enter the message: This is TunnelForge
-Enter the message: Testing encrypted communication
+The test generates/loads persistent Ed25519 identity keys and verifies
+identity continuity.
+
+### Trusted identities
+
+It checks that:
+
+``` text
+client trusted_server_public == server identity_public
 ```
 
-The server receives and decrypts the messages.
+and:
 
-You should see something similar to:
-
-```text
-Client says: Hello
-Client says: This is TunnelForge
-Client says: Testing encrypted communication
+``` text
+server trusted_client_public == client identity_public
 ```
 
----
+### Ed25519 signatures
 
-## Step 4 — End the connection
+It verifies that a valid signature is accepted and modified data is
+rejected.
 
-Enter:
+### Signed ephemeral keys
 
-```text
-exit
+It verifies the 96-byte:
+
+``` text
+32-byte X25519 public key
++
+64-byte Ed25519 signature
 ```
 
-The client sends the encrypted `exit` message.
+payload.
 
-The server detects it and sends an encrypted acknowledgement.
+It also modifies the ephemeral public key and confirms that signature
+verification fails.
 
-The client then displays:
+Expected result:
 
-```text
-Server replied : Message received!!!
+``` text
+MITM tampering correctly rejected
+Step 3.5 test PASSED
 ```
 
-The connection is closed gracefully.
+------------------------------------------------------------------------
 
----
+# 18. Test the Complete Tunnel
 
-# 5. Understanding the Encryption
+Once both client and server are running, verify that the interfaces
+exist:
 
-TunnelForge uses several cryptographic components.
-
-## ECDH
-
-TunnelForge uses:
-
-```text
-Elliptic Curve Diffie-Hellman
+``` bash
+ip addr show tun0
+ip addr show tun1
 ```
 
-with:
+Check the routes:
 
-```text
-SECP256R1 / P-256
+``` bash
+ip route
 ```
 
-Both client and server generate temporary key pairs.
+Then test connectivity according to the routing topology you have
+configured.
 
-Each side has:
+For the project's namespace-based testing environment, inspect the
+namespaces:
 
-```text
-Private Key
-Public Key
+``` bash
+ip netns list
 ```
 
-The public keys are exchanged.
+If your test setup contains:
 
-The private key remains on the device.
-
-Both sides then calculate the same shared secret.
-
-Conceptually:
-
-```text
-Client Private Key + Server Public Key
-                    ↓
-              Shared Secret
-
-Server Private Key + Client Public Key
-                    ↓
-              Shared Secret
+``` text
+tf-client
+tf-server
 ```
 
-Both calculations produce the same secret.
+you can inspect their addresses and routes:
 
----
-
-# 6. HKDF
-
-The raw ECDH shared secret is not directly used as the AES key.
-
-TunnelForge derives a 32-byte encryption key using:
-
-```text
-HKDF
+``` bash
+sudo ip netns exec tf-client ip addr
+sudo ip netns exec tf-server ip addr
 ```
 
-with:
+and:
 
-```text
-SHA-256
+``` bash
+sudo ip netns exec tf-client ip route
+sudo ip netns exec tf-server ip route
 ```
 
-The current derivation uses:
+------------------------------------------------------------------------
 
-```text
-info = b"VPN Key"
+# 19. Ping Test
+
+A basic tunnel validation is:
+
+``` bash
+ping <remote-tunnel-address>
 ```
 
-The resulting key is:
+For namespace-based testing, use:
 
-```text
-32 bytes = 256 bits
+``` bash
+sudo ip netns exec tf-client ping <server-address>
 ```
 
-This becomes the AES-GCM key.
+and, where appropriate:
 
----
-
-# 7. AES-GCM
-
-TunnelForge uses:
-
-```text
-AES-256-GCM
+``` bash
+sudo ip netns exec tf-server ping <client-address>
 ```
 
-AES-GCM provides both:
+The important point is that the packet should enter the client TUN
+interface, travel through the encrypted TunnelForge transport, be
+decrypted on the server, and be injected into the server TUN interface.
 
-* Confidentiality
-* Integrity/authentication
+------------------------------------------------------------------------
 
-Therefore, the receiver can detect if encrypted data has been modified.
+# 20. Verify That Traffic Is Actually Traversing the Tunnel
 
-The message is structured approximately as:
+Do not rely only on a successful `ping`.
 
-```text
-[4-byte length]
-        |
-        +-- [12-byte nonce]
-        |
-        +-- [ciphertext + authentication tag]
+A successful test should establish the packet path:
+
+``` text
+Application
+    ↓
+Client network namespace
+    ↓
+tun0
+    ↓
+Tunnel.tun_to_network()
+    ↓
+AES-GCM
+    ↓
+TCP transport
+    ↓
+Server transport
+    ↓
+AES-GCM decrypt
+    ↓
+tun1
+    ↓
+Server network namespace
 ```
 
----
+Check the TUN interfaces:
 
-# 8. Nonces
-
-Each AES-GCM message receives a new random 12-byte nonce.
-
-TunnelForge generates it using:
-
-```python
-os.urandom(12)
+``` bash
+ip -s link show tun0
+ip -s link show tun1
 ```
 
-`os.urandom()` uses the operating system's cryptographically secure random source.
+Generate traffic and check whether packet/byte counters increase.
 
-The nonce does not need to be secret.
+------------------------------------------------------------------------
 
-The important requirement with AES-GCM is that a nonce must not be reused with the same encryption key.
+# 21. Test Real Application Traffic
 
----
+After ping works, test actual application traffic.
 
-# 9. TCP Message Framing
+For example, start a simple HTTP server on one side:
 
-TCP is a byte stream.
-
-It does not preserve individual application messages.
-
-For example, if the client sends:
-
-```text
-Hello
-World
+``` bash
+python3 -m http.server 8000
 ```
 
-TCP does not guarantee that the server receives exactly:
+Then connect from the other side:
 
-```text
-Hello
-World
+``` bash
+curl http://<remote-address>:8000
 ```
 
-as two separate `recv()` calls.
+You can also test SSH if an SSH service is available:
 
-TunnelForge therefore uses length-prefix framing.
-
-Each message begins with:
-
-```text
-4-byte message length
+``` bash
+ssh user@<remote-address>
 ```
 
-followed by the encrypted data.
+The goal is to verify that the tunnel carries normal application
+traffic, not just ICMP.
 
-The format is:
+------------------------------------------------------------------------
 
-```text
-[4-byte length][encrypted message]
+# 22. Inspect the Encrypted Transport With Wireshark
+
+Wireshark can be used to inspect the physical/network transport.
+
+For the current implementation, the tunnel transport is TCP:
+
+``` text
+TCP port 5555
 ```
 
-The project also uses:
+Capture traffic on the appropriate physical/network interface.
 
-```python
-recv_exactly()
+A useful Wireshark display filter is:
+
+``` text
+tcp.port == 5555
 ```
 
-to ensure that the requested number of bytes is actually received before processing the message.
+You should see the TCP transport carrying TunnelForge data.
 
----
+The encrypted packet contents should not appear as readable original
+IP/application payloads.
 
-# 10. Testing on Two Devices
+The handshake also has recognizable structural properties:
 
-TunnelForge can also communicate between two devices on the same local network.
-
-For example:
-
-```text
-Windows Laptop
-      |
-      | Wi-Fi / Phone Hotspot
-      |
-Android Phone
+``` text
+96-byte signed ephemeral payload
 ```
 
-The laptop runs:
+while application packets are encrypted with AES-GCM.
 
-```text
-server.py
+------------------------------------------------------------------------
+
+# 23. Useful Linux Debugging Commands
+
+### Check listening sockets
+
+``` bash
+sudo ss -lntp
 ```
 
-The phone runs:
+Look for:
 
-```text
-client.py
+``` text
+:5555
 ```
 
----
+### Check the server port
 
-# 11. Find the Laptop IP Address
-
-On Windows, open PowerShell and run:
-
-```powershell
-ipconfig
+``` bash
+sudo ss -lntp | grep 5555
 ```
 
-Look for the network adapter that is currently being used.
+### Check TUN interfaces
 
-For example:
-
-```text
-IPv4 Address. . . . . . . . . . . : 10.160.1.155
+``` bash
+ip link show
 ```
 
-The actual address will depend on your network.
+or:
 
-Do not copy the example address above unless it is actually shown by your `ipconfig`.
-
----
-
-# 12. Configure the Client
-
-In `client.py`, the client should connect to the laptop's current LAN/hotspot IP.
-
-For example:
-
-```text
-192.xx.xx
+``` bash
+ip addr
 ```
 
-The port remains:
+### Check routes
 
-```text
-5555
+``` bash
+ip route
 ```
 
-The important difference is:
+### Check network namespaces
 
-### Localhost testing
-
-```text
-127.0.0.1:5555
+``` bash
+ip netns list
 ```
 
-### Another device
+### Inspect namespace interfaces
 
-```text
-<Device-IP>:5555
+``` bash
+sudo ip netns exec tf-client ip addr
+sudo ip netns exec tf-server ip addr
 ```
 
-For example:
+### Inspect namespace routes
 
-```text
-192.xx.xx:5555
+``` bash
+sudo ip netns exec tf-client ip route
+sudo ip netns exec tf-server ip route
 ```
 
----
+### Check which process owns `/dev/net/tun`
 
-# 13. Windows Firewall
-
-When the server is first run, Windows may show a firewall notification asking whether Python should be allowed through the firewall.
-
-For testing on your private network, allow Python on the appropriate **Private network** profile.
-
-If Windows Firewall blocks port `5555`, the phone may be unable to connect even when the IP address is correct.
-
----
-
-# 14. Android / Termux Setup
-
-TunnelForge can also run its Python client on an Android phone using **Termux**.
-
-Install Termux from a trusted source such as the official Termux project/F-Droid distribution.
-
-Open Termux and update its package information:
-
-```bash
-pkg update
+``` bash
+sudo lsof /dev/net/tun
 ```
 
-Then install Python:
+This is useful when you receive an error indicating that the TUN device
+is busy.
 
-```bash
-pkg install python
+------------------------------------------------------------------------
+
+# 24. Common Problems
+
+## PermissionError opening `/dev/net/tun`
+
+Run the client/server with root privileges:
+
+``` bash
+sudo python3 client.py
 ```
 
----
+and:
 
-# 15. Install Cryptography on Termux
-
-The standard:
-
-```bash
-pip install cryptography
+``` bash
+sudo python3 server.py
 ```
 
-may attempt to build dependencies and fail on Android.
+Check that the TUN device exists:
 
-Termux provides a prebuilt package, so install:
+``` bash
+ls -l /dev/net/tun
+```
 
-```bash
-pkg install python-cryptography
+------------------------------------------------------------------------
+
+## `Address already in use`
+
+Check for an existing process:
+
+``` bash
+sudo ss -lntp | grep 5555
+```
+
+Stop the old server process before starting a new one.
+
+------------------------------------------------------------------------
+
+## TUN interface already exists
+
+Check:
+
+``` bash
+ip link show tun0
+ip link show tun1
+```
+
+Remove a stale interface if necessary:
+
+``` bash
+sudo ip link delete tun0
+```
+
+or:
+
+``` bash
+sudo ip link delete tun1
+```
+
+Only remove an interface if it belongs to this experiment.
+
+------------------------------------------------------------------------
+
+## `Connection refused`
+
+Make sure the server is running first:
+
+``` bash
+sudo python3 server.py
 ```
 
 Then verify:
 
-```bash
-python -c "import cryptography; print(cryptography.__version__)"
+``` bash
+sudo ss -lntp | grep 5555
 ```
 
-You should see the installed version.
+Also verify that the client's `HOST` value points to the correct server
+IP.
 
----
+------------------------------------------------------------------------
 
-# 16. Copy `client.py` to the Android Phone
+## Identity verification failure
 
-The easiest approach is to place `client.py` in the Android Download directory.
+If you see:
 
-In Termux, allow storage access:
-
-```bash
-termux-setup-storage
+``` text
+SERVER IDENTITY VERIFICATION FAILED
 ```
 
-After granting permission, Termux provides access through:
+check:
 
-```text
-~/storage/downloads/
+``` bash
+cmp \
+  keys/client/trusted_server_public.bin \
+  keys/server/identity_public.bin
 ```
+
+The command should produce no output when the files match.
+
+For the client identity:
+
+``` bash
+cmp \
+  keys/server/trusted_client_public.bin \
+  keys/client/identity_public.bin
+```
+
+If the identity keys were regenerated, the trusted public-key files must
+also be updated.
+
+------------------------------------------------------------------------
+
+## `Invalid trusted ... public key`
+
+Check the file size:
+
+``` bash
+wc -c keys/client/trusted_server_public.bin
+wc -c keys/server/trusted_client_public.bin
+```
+
+Each Ed25519 public key must be 32 bytes in this implementation.
+
+------------------------------------------------------------------------
+
+## No ping response
+
+First check:
+
+``` bash
+ip addr
+ip route
+```
+
+Then check both TUN interfaces:
+
+``` bash
+ip addr show tun0
+ip addr show tun1
+```
+
+For namespace testing:
+
+``` bash
+sudo ip netns exec tf-client ip route
+sudo ip netns exec tf-server ip route
+```
+
+Also verify that the TunnelForge processes are still running and that
+the TCP session remains established:
+
+``` bash
+ss -tn
+```
+
+A successful application-level ping requires correct routing in addition
+to a successful encrypted tunnel.
+
+------------------------------------------------------------------------
+
+# 25. Security Design
+
+TunnelForge currently demonstrates several important security concepts.
+
+### Confidentiality
+
+Tunnel packets are encrypted using AES-GCM.
+
+### Integrity and authentication of encrypted packets
+
+AES-GCM provides authenticated encryption. Modified ciphertext should
+fail decryption.
+
+### Forward session separation
+
+The tunnel uses fresh X25519 ephemeral keys for session establishment.
+
+### Peer authentication
+
+Persistent Ed25519 identity keys authenticate the ephemeral X25519
+public keys.
+
+### Trusted-peer model
+
+The client and server explicitly store trusted peer public keys.
+
+### Key derivation
+
+The raw X25519 shared secret is passed through HKDF-SHA256 rather than
+being used directly as the AES key.
+
+------------------------------------------------------------------------
+
+# 26. Current Security/Protocol Limitations
+
+TunnelForge is an educational implementation and still has important
+limitations.
+
+## TCP transport
+
+The current implementation runs the encrypted tunnel over TCP.
+
+This can cause TCP-over-TCP performance problems when the tunnel itself
+carries TCP connections.
+
+A later project stage is intended to move the transport to UDP.
+
+## Handshake replay protection
+
+The current signed handshake authenticates the ephemeral public key, but
+the signature is currently over the ephemeral public key itself.
+
+A future improvement is to bind the signature to a fresh handshake nonce
+so an old valid signed payload cannot simply be replayed in a new
+handshake.
+
+## Packet replay/reordering protection
+
+The current tunnel does not implement an independent packet
+sequence-number/window mechanism for encrypted data packets.
+
+A later stage is planned to add replay and reordering protection,
+particularly for UDP.
+
+## Automatic key rotation
+
+The current tunnel establishes a session key at handshake time but does
+not automatically rekey during a long-running session.
+
+A later stage is planned for automatic key rotation.
+
+## Multi-peer support
+
+The current server accepts a single TCP client.
+
+Multi-peer support is a future architectural stage.
+
+## Connection persistence/roaming
+
+The current implementation does not provide roaming or automatic
+connection persistence.
+
+## MTU/fragmentation handling
+
+The current implementation reads up to 65535 bytes from the TUN device,
+but it does not implement a complete VPN-style MTU/fragmentation
+strategy.
+
+This becomes especially important when the transport is moved to UDP.
+
+------------------------------------------------------------------------
+
+# 27. Planned Development Roadmap
+
+The project has been developed in stages.
+
+### Stage 1 --- Basic encrypted tunnel
+
+Initial transport and encryption concepts.
+
+### Stage 2 --- TUN-based tunneling
+
+Move from application-level test data to raw IP packets through Linux
+TUN interfaces.
+
+### Stage 3 --- Trustworthy handshake
+
+Add:
+
+-   Persistent Ed25519 identities
+-   Ephemeral X25519 keys
+-   Signed ephemeral keys
+-   Trusted peer public keys
+-   Signature verification before using the peer's ephemeral key
+
+### Stage 4 --- Network/application validation
+
+Validate:
+
+-   TUN routing
+-   Ping
+-   Real application traffic
+-   Wireshark visibility
+-   Encrypted transport
+
+### Stage 5 --- UDP transport
+
+Planned changes include:
+
+-   Replace TCP sockets with UDP sockets
+-   Remove TCP length-prefix framing
+-   Preserve complete datagram boundaries
+-   Reconsider packet size and MTU
+-   Re-run the authenticated handshake over UDP
+-   Re-test the tunnel with ping and real application traffic
+
+### Stage 6 --- Automatic key rotation
+
+Planned periodic/threshold-based session rekeying.
+
+### Stage 7 --- Replay and reordering protection
+
+Planned sequence numbers and replay-window logic for encrypted data
+packets.
+
+### Stage 8 --- Multi-peer support
+
+Planned server architecture for multiple simultaneous peers.
+
+### Stage 9 --- Roaming and connection persistence
+
+Planned handling of changing network paths and persistent sessions.
+
+------------------------------------------------------------------------
+
+# 28. Recommended `.gitignore`
+
+Do not publish private identity keys.
+
+Example:
+
+``` gitignore
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+
+keys/*/identity_private.bin
+
+*.pcap
+*.pcapng
+
+.idea/
+.vscode/
+```
+
+If you want the repository to include example/public test keys, clearly
+label them as disposable test keys.
+
+------------------------------------------------------------------------
+
+# 29. Development Notes
+
+TunnelForge intentionally keeps cryptographic operations in one module:
+
+``` text
+crypto/encryption.py
+```
+
+The networking logic is separated into:
+
+``` text
+network/transport.py
+network/tunnel.py
+```
+
+and TUN handling is isolated in:
+
+``` text
+tun/tun_device.py
+```
+
+This modular design makes it possible to replace the transport layer
+without rewriting the encryption or TUN logic.
+
+For example, the planned UDP transition should primarily replace the
+transport semantics while preserving the higher-level relationship:
+
+``` text
+TUN ↔ Tunnel ↔ Transport
+```
+
+------------------------------------------------------------------------
+
+# 30. Safety Notice
+
+TunnelForge is intended for controlled educational and research
+environments.
+
+Do not use it as a replacement for mature VPN software or assume that
+the current protocol provides the security properties of production VPN
+protocols such as WireGuard.
+
+Use isolated machines, virtual machines, network namespaces, or a
+private lab network when experimenting with routing and packet
+forwarding.
+
+------------------------------------------------------------------------
+
+# 31. License
+
+Choose and add a license appropriate for your project.
 
 For example:
 
-```bash
-ls ~/storage/downloads/
+``` text
+MIT License
 ```
 
-If `client.py` is there, copy it to the Termux home directory:
+If using the MIT License, add a `LICENSE` file containing the official
+license text.
 
-```bash
-cp ~/storage/downloads/client.py ~/
+------------------------------------------------------------------------
+
+# 32. Quick Start
+
+For a quick test on two Linux endpoints:
+
+### Server
+
+``` bash
+git clone <YOUR-GITHUB-REPOSITORY-URL>
+cd TunnelForge
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install cryptography
+
+sudo python3 server.py
 ```
 
-Now verify:
+### Client
 
-```bash
-ls ~/
+``` bash
+git clone <YOUR-GITHUB-REPOSITORY-URL>
+cd TunnelForge
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install cryptography
+
+sudo python3 client.py
 ```
 
-You should see:
+Before launching the two processes, make sure:
 
-```text
-client.py
+1.  The server identity keys exist.
+2.  The client identity keys exist.
+3.  `trusted_server_public.bin` contains the server public identity key.
+4.  `trusted_client_public.bin` contains the client public identity key.
+5.  The client's `HOST` points to the server.
+6.  TCP port `5555` is reachable.
+7.  `/dev/net/tun` is available.
+8.  Required routes have been configured for the test topology.
+
+------------------------------------------------------------------------
+
+## 33. Project Goal
+
+The goal of TunnelForge is not merely to create a working encrypted
+socket.
+
+It is to understand the individual building blocks of a VPN:
+
+``` text
+Linux TUN
+   ↓
+IP packet handling
+   ↓
+Packet encryption
+   ↓
+Key exchange
+   ↓
+Peer authentication
+   ↓
+Secure transport
+   ↓
+Routing
+   ↓
+Real application traffic
 ```
 
----
-
-# 17. Test Network Connectivity
-
-Before running the Python client, you can test whether the phone can reach the laptop's TCP port.
-
-Install netcat if necessary:
-
-```bash
-pkg install netcat-openbsd
-```
-
-Then run:
-
-```bash
-nc <LAPTOP-IP> 5555
-```
-
-For example:
-
-```bash
-nc 10.160.1.155 5555
-```
-
-If the server reports a connection, basic network connectivity is working.
-
-The `nc` test itself does not perform TunnelForge's cryptographic handshake, so the server may subsequently report a connection error. That is expected.
-
-`nc` is only being used here to test the TCP connection.
-
----
-
-# 18. Run the TunnelForge Client on Android
-
-Once network connectivity is confirmed:
-
-```bash
-python ~/client.py
-```
-
-The Android phone becomes the TunnelForge client.
-
-The Windows laptop runs:
-
-```bash
-python server.py
-```
-
-The communication path is:
-
-```text
-Android / Termux
-       |
-       | TCP :5555
-       |
-       ↓
-Windows Laptop
-       |
-       ↓
-TunnelForge Server
-```
-
-Messages are encrypted before being sent over the TCP connection.
-
----
-
-# 19. Example Phone-to-Laptop Test
-
-### Laptop
-
-Run:
-
-```powershell
-python server.py
-```
-
-### Android
-
-Run:
-
-```bash
-python ~/client.py
-```
-
-Then enter:
-
-```text
-Hello from Android
-```
-
-The server should decrypt and display:
-
-```text
-Client says: Hello from Android
-```
-
-You can send multiple messages:
-
-```text
-Hello from Android
-This is TunnelForge
-Testing encrypted communication
-```
-
-Finally:
-
-```text
-exit
-```
-
-The server sends the encrypted acknowledgement.
-
----
-
-# 20. Connection Handling
-
-TunnelForge includes basic graceful connection handling.
-
-The program handles situations such as:
-
-* Unexpected TCP connection closure
-* User pressing `Ctrl+C`
-* Normal `exit` command
-* Closing client sockets
-* Closing server sockets
-
-The code uses `try`, `except`, and `finally` blocks so sockets are closed even when the program is interrupted.
-
----
-
-# 21. Security Demonstration
-
-AES-GCM provides authentication in addition to encryption.
-
-If encrypted data is modified, the authentication tag becomes invalid.
-
-TunnelForge was tested by deliberately modifying encrypted data.
-
-Conceptually:
-
-```text
-Original encrypted message
-          ↓
-       Modified
-          ↓
-     AES-GCM decrypt
-          ↓
-      InvalidTag
-```
-
-The modified message is therefore rejected instead of being silently accepted as valid plaintext.
-
----
-
-# 22. Current Protocol
-
-The current TunnelForge protocol can be summarized as:
-
-```text
-1. TCP connection
-       ↓
-2. Client generates ephemeral ECDH key pair
-       ↓
-3. Server generates ephemeral ECDH key pair
-       ↓
-4. Exchange public keys
-       ↓
-5. Calculate ECDH shared secret
-       ↓
-6. HKDF-SHA256
-       ↓
-7. Derive 32-byte AES key
-       ↓
-8. Encrypt messages using AES-GCM
-       ↓
-9. Add length prefix
-       ↓
-10. Send through TCP
-       ↓
-11. Receiver reads exact length
-       ↓
-12. AES-GCM authentication + decryption
-       ↓
-13. Process plaintext
-```
-
----
-
-# 23. Example Wire Format
-
-A normal encrypted message is transmitted as:
-
-```text
-+----------------------+-----------------------------+
-| 4-byte length        | Encrypted message           |
-+----------------------+-----------------------------+
-                           |
-                           +-- 12-byte nonce
-                           |
-                           +-- ciphertext
-                           |
-                           +-- GCM authentication tag
-```
-
-The length field allows the receiver to determine exactly how many bytes belong to the encrypted message.
-
----
-
-# 24. Important Security Notes
-
-TunnelForge is currently an educational security/networking project.
-
-It demonstrates important cryptographic concepts, but it should not yet be considered a production VPN or secure messaging application.
-
-For example, the current protocol does not yet provide:
-
-* Peer identity authentication
-* Certificate infrastructure
-* Protection against active man-in-the-middle attacks
-* Separate encryption keys for each communication direction
-* Persistent identity keys
-* Replay protection beyond the properties provided by the current session design
-* Production-grade session management
-* Automatic key rotation
-* Full VPN packet tunneling
-* Operating-system-level routing
-
-ECDH establishes a shared secret, but by itself it does not prove who the other endpoint is.
-
----
+By implementing these components separately, TunnelForge provides a
+practical environment for studying:
+
+-   Linux networking
+-   Virtual network interfaces
+-   Socket programming
+-   VPN architecture
+-   Public-key cryptography
+-   Authenticated key exchange
+-   AEAD encryption
+-   Routing
+-   Network namespaces
+-   Packet inspection
+-   Protocol design
+-   Security engineering

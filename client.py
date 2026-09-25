@@ -1,12 +1,14 @@
 import os
+from pathlib import Path
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (Ed25519PublicKey)
 from tun.tun_device import TunDevice
 from crypto.encryption import Encryption
 from network.transport import Transport
 from network.tunnel import Tunnel
 
 
-HOST = "127.0.0.1"
+HOST = "192.168.100.2"
 PORT = 5555
 
 
@@ -22,15 +24,49 @@ try:
     transport = Transport()
     transport.connect(HOST, PORT)
 
-    client_private = Encryption.generate_key_exchange()
-    client_public = Encryption.get_public_key(client_private)
-    transport.send(client_public)
+    # ---------------------------------------------------------
+    # Authenticated X25519 handshake
+    # ---------------------------------------------------------
+    print("\nStarting authenticated handshake")
 
-    server_public = transport.receive()
-    session_key = Encryption.derive_session_key(client_private, server_public)
+    client_identity = Encryption.load_identity_key("keys/client/identity_private.bin")
+    client_ephemeral_private = Encryption.generate_key_exchange()
+    client_ephemeral_public = Encryption.get_public_key(client_ephemeral_private)
+
+    #sign the ephemeral X25519 public key
+    client_handshake_payload = (Encryption.create_signed_ephemeral_key(client_identity, client_ephemeral_public))
+    print("Sending authenticted client ephemeral key....")
+
+    #send 32 bytes X25519 public key + 64 bytes Ed25519 signature
+    transport.send(client_handshake_payload)
+
+    #receive server's signed ephemeral key
+    server_handshake_payload = transport.receive()
+    print("Received authenticated server ephemeral key")
+
+    #Parse server payload
+    server_ephemeral_public, server_signature = (
+        Encryption.parse_signed_empheral_key(server_handshake_payload
+        )
+    )
+
+    #load trusted server identity
+    trusted_server_public_bytes = Path("keys/client/trusted_server_public.bin").read_bytes()
+
+    if len(trusted_server_public_bytes) != 32:
+        raise RuntimeError("Invalid trusted server public key")
+
+    trusted_server_public = Ed25519PublicKey.from_public_bytes(trusted_server_public_bytes)
+
+    #Verift the server BEFORE using its X25519 key
+    if not Encryption.verify(trusted_server_public, server_signature, server_ephemeral_public):
+        raise RuntimeError("SERVER IDENTITY VERIFICATION FAILED")
+    print("Server identity verification successful...")
+
+    #Now derive the session key
+    session_key = Encryption.derive_session_key(client_ephemeral_private, server_ephemeral_public)
+
     crypto = Encryption(session_key)
-    print("In-memory session key established on client")
-    
 
     tunnel = Tunnel(
         tun=tun,
@@ -55,3 +91,5 @@ finally:
     tun.close()
 
     print("Client resources closed")
+
+    
